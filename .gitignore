@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+/backend/node_modules/
+/frontend/node_modules/
+
+# Mobile App (managed in its own separate GitHub repository: https://github.com/Rik23A/ShramikSevaApp)
+/ShramikSevaApp/
+
+# Next.js Build Artifacts
+/frontend/.next/
+/frontend/out/
+/frontend/build/
+*.tsbuildinfo
+
+# Environment variables & secrets (NEVER commit real credentials)
+.env
+.env.*
+.env*.local
+/backend/.env*
+/frontend/.env*
+!/backend/.env.example
+!/frontend/.env.example
+
+# Sensitive credentials & service keys
+/backend/config/serviceAccountKey.json
+*.pem
+*.key
+
+# User Uploads
+/uploads/
+/backend/uploads/
+
+# Archives & Temporary files (prevents repository bloat and corruption)
+*.zip
+*.tar.gz
+*.rar
+*.7z
+scratch/
+
+# Logs & Debugging
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*-p/

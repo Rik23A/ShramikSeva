@@ -1,0 +1,677 @@
+const https = require('https');
+
+const PaytmChecksum = require('paytmchecksum');
+
+const Payment = require('../models/Payment');
+
+const { activateSubscription, activateWorklogAddon, calculatePlanPrice } = require('../services/subscriptionService');
+const { emitToUser } = require('../socket');
+const { queryPaytmStatus } = require('../utils/paytmUtils');
+
+
+
+
+// Use environment variables for Paytm config
+
+const PAYTM_MID = process.env.PAYTM_MID || 'YOUR_MID_HERE';
+
+const PAYTM_MERCHANT_KEY = process.env.PAYTM_MERCHANT_KEY;
+
+const WEBSITE = process.env.PAYTM_WEBSITE || 'WEBSTAGING';
+
+const INDUSTRY_TYPE_ID = process.env.PAYTM_INDUSTRY_TYPE_ID || 'Retail';
+
+const CALLBACK_URL = process.env.PAYTM_CALLBACK_URL;
+
+
+
+/**
+
+ * Initiate Paytm Payment
+
+ * @route POST /api/payments/paytm/initiate
+
+ */
+
+exports.initiateWithPaytm = async (req, res) => {
+
+    try {
+
+        const { orderId, customerId, email, phone, planId, platform } = req.body;
+
+        let { amount } = req.body;
+
+
+
+        if (!orderId || !customerId || !planId) {
+
+            return res.status(400).json({ success: false, message: 'Missing required fields' });
+
+        }
+
+
+
+        // --- SECURITY FIX: Dynamic Price Calculation ---
+        // Instead of trusting client-provided 'amount', we calculate it on the server
+        const pricing = await calculatePlanPrice(customerId, planId);
+        const calculatedAmount = pricing.totalAmount;
+
+        // If amount was provided, we can log if it doesn't match (for auditing manipulation attempts)
+        if (amount && Math.abs(parseFloat(amount) - calculatedAmount) > 1) {
+            console.warn(`🚨 Price Manipulation Attempt! User ${customerId} requested ${amount} for ${planId}, but calculated price is ${calculatedAmount}.`);
+        }
+
+        // Always use the server-calculated price
+        amount = calculatedAmount;
+        // ----------------------------------------------
+
+
+
+        const MID = PAYTM_MID.trim();
+
+        const MKEY = (PAYTM_MERCHANT_KEY || '').trim();
+
+
+
+        const paytmParams = {};
+
+
+
+        paytmParams.body = {
+
+            "requestType": "Payment",
+
+            "mid": MID,
+
+            "websiteName": WEBSITE.trim(),
+
+            "orderId": orderId.toString().trim(),
+
+            "callbackUrl": (process.env.PAYTM_CALLBACK_URL && process.env.PAYTM_CALLBACK_URL.trim().endsWith('=')
+
+                ? process.env.PAYTM_CALLBACK_URL.trim() + orderId.toString().trim()
+
+                : (process.env.PAYTM_CALLBACK_URL ? process.env.PAYTM_CALLBACK_URL.trim() + `?ORDER_ID=${orderId}` : "")),
+
+            "txnAmount": {
+
+                "value": parseFloat(amount).toFixed(2),
+
+                "currency": "INR",
+
+            },
+
+            "userInfo": {
+
+                "custId": customerId.toString().trim(),
+
+                "mobile": phone ? phone.toString().trim() : "",
+
+                "email": email ? email.toString().trim() : "",
+
+            },
+
+        };
+
+
+
+        // Add channelId and industryTypeId dynamically based on platform
+        paytmParams.body.channelId = platform === 'web' ? 'WEB' : (process.env.PAYTM_CHANNEL_ID || "WAP").trim();
+        paytmParams.body.industryTypeId = (process.env.PAYTM_INDUSTRY_TYPE_ID || "Retail").trim();
+
+
+
+        // Remove empty fields from userInfo to avoid validation errors
+
+        if (!paytmParams.body.userInfo.mobile) delete paytmParams.body.userInfo.mobile;
+
+        if (!paytmParams.body.userInfo.email) delete paytmParams.body.userInfo.email;
+
+
+
+        // Generate checksum
+
+        let checksum;
+
+        try {
+
+            // Validate merchant key — accept any non-empty key that isn't a placeholder
+
+            if (!MKEY || MKEY === 'YOUR_KEY_HERE') {
+
+                console.error('❌ Paytm Error: PAYTM_MERCHANT_KEY is not set or is still a placeholder in .env');
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message: 'Paytm configuration error: PAYTM_MERCHANT_KEY is missing or not configured. Please check your .env file.'
+
+                });
+
+            }
+
+
+
+            // For V1 APIs, Paytm expects the signature on the JSON string of the body
+
+            const bodyString = JSON.stringify(paytmParams.body);
+
+            checksum = await PaytmChecksum.generateSignature(bodyString, MKEY);
+
+        } catch (checksumError) {
+
+            console.error('Checksum Generation Error:', checksumError);
+
+            return res.status(500).json({ success: false, message: 'Failed to generate payment signature', error: checksumError.message });
+
+        }
+
+
+
+        paytmParams.head = {
+
+            "signature": checksum
+
+        };
+
+
+
+        const post_data = JSON.stringify(paytmParams);
+
+        console.log('Paytm Request Data:', post_data); // Log actual request for debugging
+
+
+
+        const options = {
+
+            hostname: WEBSITE === 'WEBSTAGING' ? 'securestage.paytmpayments.com' : 'secure.paytmpayments.com',
+
+            port: 443,
+
+            path: `/theia/api/v1/initiateTransaction?mid=${MID}&orderId=${orderId}`,
+
+            method: 'POST',
+
+            headers: {
+
+                'Content-Type': 'application/json',
+
+                'Content-Length': Buffer.byteLength(post_data),
+
+                'User-Agent': 'Node/22'
+
+            }
+
+        };
+
+
+
+        let response = "";
+
+        const post_req = https.request(options, (post_res) => {
+
+            post_res.on('data', (chunk) => { response += chunk; });
+
+            post_res.on('end', async () => {
+
+                let resData;
+
+                try {
+
+                    resData = JSON.parse(response);
+
+                } catch (parseError) {
+
+                    console.error('Paytm Response Parse Error:', response);
+
+                    return res.status(500).json({ success: false, message: 'Invalid response from Paytm', raw: response });
+
+                }
+
+                // 🔍 Full response log for debugging
+
+                console.log('🔍 Full Paytm Response:', JSON.stringify(resData, null, 2));
+
+
+
+                if (resData.body && resData.body.resultInfo && resData.body.resultInfo.resultStatus === 'S') {
+
+                    // Create pending payment record in DB
+
+                    try {
+
+                        await Payment.create({
+
+                            user: customerId,
+
+                            orderId: orderId,
+
+                            amount: parseFloat(amount),
+
+                            planId: planId,
+
+                            platform: platform || 'mobile',
+
+                            status: 'pending'
+
+                        });
+
+                    } catch (dbError) {
+
+                        console.error('Database Error creating payment record:', dbError);
+
+                    }
+
+
+
+                    res.status(200).json({
+
+                        success: true,
+
+                        txnToken: resData.body.txnToken,
+
+                        orderId: paytmParams.body.orderId,
+
+                        mid: MID,
+
+                        host: WEBSITE === 'WEBSTAGING' ? 'securestage.paytmpayments.com' : 'secure.paytmpayments.com'
+
+                    });
+
+                } else {
+
+                    console.error('Paytm Initiation Failed. Status:', resData.body?.resultInfo?.resultStatus, 'Msg:', resData.body?.resultInfo?.resultMsg);
+
+                    res.status(500).json({
+
+                        success: false,
+
+                        message: 'Paytm initiation failed',
+
+                        details: resData.body ? resData.body.resultInfo : resData
+
+                    });
+
+                }
+
+            });
+
+        });
+
+
+
+        post_req.on('error', (e) => {
+
+            console.error('Paytm Request Error:', e);
+
+            res.status(500).json({ success: false, message: 'Failed to connect to Paytm', error: e.message });
+
+        });
+
+
+
+        post_req.write(post_data);
+
+        post_req.end();
+
+
+
+    } catch (error) {
+
+        console.error('Paytm Initiate Error:', error);
+
+        res.status(500).json({ success: false, message: 'Internal server error' });
+
+    }
+
+};
+
+
+
+/**
+
+ * Handle Paytm Callback
+
+ * @route POST /api/payments/paytm/callback
+
+ */
+
+exports.handlePaytmCallback = async (req, res) => {
+
+    try {
+
+        const paytmParams = req.body;
+
+        const checksum = paytmParams.CHECKSUMHASH;
+
+        delete paytmParams.CHECKSUMHASH;
+
+
+
+        const isVerifySignature = PaytmChecksum.verifySignature(paytmParams, PAYTM_MERCHANT_KEY, checksum);
+
+
+
+        let status = 'failure';
+
+        let orderId = paytmParams.ORDERID;
+
+        let txnId = paytmParams.TXNID;
+
+
+
+        // Find the payment record
+
+        const payment = await Payment.findOne({ orderId: orderId });
+
+
+
+        if (isVerifySignature) {
+
+            const resultStatus = paytmParams.STATUS;
+
+
+
+            if (resultStatus === 'TXN_SUCCESS') {
+                status = 'success';
+                if (payment) {
+                    if (payment.status === 'success') {
+                        console.log(`Payment duplicate webhook received and skipped for order: ${orderId}`);
+                    } else if (parseFloat(paytmParams.TXNAMOUNT) !== payment.amount) {
+                        console.error(`🚨 Payment Amount Mismatch for order ${orderId}: Expected ${payment.amount}, got ${paytmParams.TXNAMOUNT}. Potential tampering.`);
+                        payment.status = 'failure';
+                        payment.gatewayResponse = paytmParams;
+                        payment.gatewayResponse.errorReason = 'Amount Validation Failed';
+                        await payment.save();
+                        status = 'failed';
+                        emitToUser(payment.user.toString(), 'payment:status', { orderId, status: 'failed', error: 'Amount validation failed' });
+                    } else {
+                        payment.status = 'success';
+                        payment.txnId = txnId;
+                        payment.bankTxnId = paytmParams.BANKTXNID;
+                        payment.paymentMethod = paytmParams.PAYMENTMODE;
+                        payment.gatewayResponse = paytmParams;
+                        await payment.save();
+
+                        // Emit WebSocket success status to the client instantly
+                        emitToUser(payment.user.toString(), 'payment:status', { orderId, status: 'success', txnId });
+
+                        // DECOUPLED ASYNC FULFILLMENT: Activate in background thread
+                        setImmediate(async () => {
+                            if (payment.planId === 'worklog_access') {
+                                try {
+                                    await activateWorklogAddon(payment.user);
+                                    console.log(`✅ Worklog Access activated asynchronously for user ${payment.user}`);
+                                } catch (subError) {
+                                    console.error('❌ Failed to activate worklog addon asynchronously after payment:', subError);
+                                }
+                            } else if (payment.planId) {
+                                try {
+                                    await activateSubscription(payment.user, payment.planId);
+                                    console.log(`✅ Subscription activated asynchronously for user ${payment.user} - Plan: ${payment.planId}`);
+                                } catch (subError) {
+                                    console.error('❌ Failed to activate subscription asynchronously after payment:', subError);
+                                }
+                            }
+                        });
+                    }
+                }
+            } else {
+                status = 'failed';
+                if (payment) {
+                    payment.status = 'failure';
+                    payment.gatewayResponse = paytmParams;
+                    await payment.save();
+                    emitToUser(payment.user.toString(), 'payment:status', { orderId, status: 'failed' });
+                }
+            }
+
+        }
+
+
+        // Determine Redirect URL based on platform
+        let redirectUrl;
+
+        // Try extracting embedded locale from orderId (e.g., SS-EN-WEB-... or SS-HI-WEB-...)
+        let extractedLocale = 'en';
+        if (orderId && orderId.startsWith('SS-') && orderId.includes('-WEB-')) {
+            const parts = orderId.split('-');
+            if (parts.length >= 2) {
+                const potentialLocale = parts[1].toLowerCase();
+                if (['en', 'hi', 'bn', 'te', 'ta', 'mr', 'gu', 'kn', 'ml', 'pa', 'or', 'as'].includes(potentialLocale)) {
+                    extractedLocale = potentialLocale;
+                }
+            }
+        }
+
+        if (payment && payment.platform === 'web') {
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+            redirectUrl = `${frontendUrl}/${extractedLocale}/subscriptions/status?status=${status}&orderId=${orderId}&txnId=${txnId}`;
+        } else {
+            // Mobile App Deep Link
+            redirectUrl = `shramiksevaapp://payment-status?status=${status}&orderId=${orderId}&txnId=${txnId}`;
+        }
+
+
+
+        res.send(`
+
+            <html>
+
+                <head>
+
+                    <title>Payment Status</title>
+
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+                    <style>
+
+                        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; alignItems: center; height: 100vh; margin: 0; background-color: #f5f5f5; }
+
+                        .card { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 90%; }
+
+                        h1 { color: ${status === 'success' ? '#4CAF50' : '#F44336'}; margin-bottom: 1rem; }
+
+                        p { color: #666; margin-bottom: 2rem; }
+
+                        .btn { display: inline-block; background: #2196F3; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold; }
+
+                    </style>
+
+                </head>
+
+                <body>
+
+                    <div class="card">
+
+                        <h1>Payment ${status === 'success' ? 'Successful' : 'Failed'}</h1>
+
+                        <p>You will be redirected back to the app shortly...</p>
+
+                        <a href="${redirectUrl}" class="btn">Return to App</a>
+
+                    </div>
+
+                    <script>
+
+                        setTimeout(function() {
+
+                            window.location.href = "${redirectUrl}";
+
+                        }, 1000);
+
+                    </script>
+
+                </body>
+
+            </html>
+
+        `);
+
+
+
+    } catch (error) {
+
+        console.error('Callback Error:', error);
+
+        res.status(500).send('<h1>Something went wrong processing the callback</h1>');
+
+    }
+
+};
+
+
+
+/**
+
+ * Render Paytm Payment Form (for WebBrowser handoff)
+
+ */
+
+/**
+ * Render Paytm Payment Form (for WebBrowser handoff)
+ */
+exports.renderPaytmForm = async (req, res) => {
+    try {
+        const { txnToken, orderId, mid } = req.query;
+
+        if (!txnToken || !orderId || !mid) {
+            return res.status(400).send('<h1>Invalid Payment Parameters</h1>');
+        }
+
+        // Security: HTML-encode all query parameters before interpolating into HTML
+        const escapeHtml = (str) => String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\//g, '&#x2F;');
+        const safeTxnToken = escapeHtml(txnToken);
+        const safeOrderId = escapeHtml(orderId);
+        const safeMid = escapeHtml(mid);
+
+        // Use the same host logic as initiation
+        const WEBSITE = (process.env.PAYTM_WEBSITE || 'WEBSTAGING').trim();
+        const host = WEBSITE === 'WEBSTAGING' ? 'securestage.paytmpayments.com' : 'secure.paytmpayments.com';
+
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+                <head>
+                    <title>Processing Payment...</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f5f5f5; }
+                        .container { background: white; padding: 2.5rem; border-radius: 1.5rem; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; max-width: 450px; width: 90%; }
+                        h1 { color: #1A1A2E; margin-bottom: 1rem; font-size: 1.5rem; font-weight: 700; }
+                        p { color: #64748B; margin-bottom: 2rem; line-height: 1.5; }
+                        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #2196F3; border-radius: 50%; width: 48px; height: 48px; animation: spin 1s linear infinite; margin: 0 auto 24px; }
+                        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                        .btn { display: inline-block; background: #2196F3; color: white; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-weight: 600; border: none; cursor: pointer; transition: background 0.2s; width: 100%; }
+                        .btn:hover { background: #1976D2; }
+                        .secondary-text { margin-top: 1.5rem; color: #94A3B8; font-size: 0.875rem; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="loader"></div>
+                        <h1>Processing Payment</h1>
+                        <p>We are securely redirecting you to the payment gateway. <strong>Please do not refresh or close this page.</strong></p>
+                        
+                        <form id="paytmForm" method="post" action="https://${host}/theia/api/v1/showPaymentPage?mid=${safeMid}&orderId=${safeOrderId}" name="paytmForm">
+                            <input type="hidden" name="mid" value="${safeMid}">
+                            <input type="hidden" name="orderId" value="${safeOrderId}">
+                            <input type="hidden" name="txnToken" value="${safeTxnToken}">
+                            <noscript>
+                                <button type="submit" class="btn">Continue to Payment</button>
+                            </noscript>
+                        </form>
+                        
+                        <div id="manual-redirect" style="display: none; margin-top: 20px;">
+                           <p style="font-size: 14px; color: #E53935; margin-bottom: 10px;">If you are not redirected automatically, click below.</p>
+                           <button type="button" class="btn" onclick="document.getElementById('paytmForm').submit()">Click here to continue</button>
+                        </div>
+
+                        <div class="secondary-text">Secured by Shramik Seva</div>
+                    </div>
+
+                    <script type="text/javascript">
+                        // Wait a tiny bit just to let the DOM settle and be visible to user
+                        setTimeout(function() {
+                            try {
+                                document.getElementById('paytmForm').submit();
+                            } catch (e) {
+                                console.error("Auto-submit failed:", e);
+                                document.getElementById('manual-redirect').style.display = 'block';
+                            }
+                        }, 500);
+
+                        // Fallback mechanism
+                        setTimeout(function() {
+                            document.getElementById('manual-redirect').style.display = 'block';
+                        }, 4000);
+                    </script>
+                </body>
+            </html>
+        `);
+    } catch (error) {
+        console.error('Render Form Error:', error);
+        res.status(500).send('<h1>Server Error</h1>');
+    }
+};
+
+// ** NEW: Polling Endpoint for Frontend fallback **
+exports.getPaymentStatus = async (req, res) => {
+    try {
+        const orderId = req.params.orderId;
+        let payment = await Payment.findOne({ orderId: orderId });
+
+        if (!payment) {
+            return res.status(404).json({ success: false, message: 'Payment not found' });
+        }
+
+        // If the transaction is pending in our database, actively query Paytm status API
+        if (payment.status === 'pending') {
+            try {
+                const resData = await queryPaytmStatus(payment.orderId);
+                const body = resData.body;
+
+                if (body && body.resultInfo && body.resultInfo.resultStatus === 'TXN_SUCCESS') {
+                    // Double check amount to prevent tampering
+                    if (parseFloat(body.txnAmount) === payment.amount) {
+                        payment.status = 'success';
+                        payment.txnId = body.txnId;
+                        payment.bankTxnId = body.bankTxnId;
+                        payment.paymentMethod = body.paymentMode;
+                        payment.gatewayResponse = body;
+                        await payment.save();
+
+                        // Activate the subscription/addon in the database
+                        if (payment.planId === 'worklog_access') {
+                            await activateWorklogAddon(payment.user);
+                        } else if (payment.planId) {
+                            await activateSubscription(payment.user, payment.planId);
+                        }
+                    }
+                } else if (body && body.resultInfo && (body.resultInfo.resultStatus === 'TXN_FAILURE' || body.resultInfo.resultStatus === 'RESP_FAILURE')) {
+                    payment.status = 'failure';
+                    payment.gatewayResponse = body;
+                    await payment.save();
+                }
+            } catch (err) {
+                console.error(`Proactive API status check failed for order ${orderId}:`, err.message);
+            }
+        }
+
+        res.status(200).json({
+            success: true,
+            status: payment.status,
+            txnId: payment.txnId
+        });
+    } catch (error) {
+        console.error('Error fetching payment status:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+};

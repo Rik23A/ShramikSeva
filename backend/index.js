@@ -1,0 +1,257 @@
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const connectDB = require('./config/db');
+const http = require('http');
+const path = require('path');
+const { initSocket, getIo } = require('./socket');
+const resetOtps = require('./cron/otpReset');
+const dailyWorkLog = require('./cron/dailyWorkLog');
+const ratingPrompt = require('./cron/ratingPrompt');
+const notificationCleanup = require('./cron/notificationCleanup');
+const dataCleanup = require('./cron/dataCleanup');
+const paymentReconciliation = require('./cron/paymentReconciliation');
+const { errorHandler, notFound, handleUnhandledRejections, handleUncaughtExceptions } = require('./middleware/errorHandler');
+const { validateEnv } = require('./config/validateEnv');
+const { securityHeaders, corsOptions, sanitizeRequest, requestLogger } = require('./middleware/security');
+const { apiLimiter, loadRateLimitsFromDb } = require('./middleware/rateLimiter');
+const { performanceMonitoring, getMetrics } = require('./middleware/monitoring');
+const cookieParser = require('cookie-parser');
+const compression = require('compression');
+
+// Load environment variables
+dotenv.config();
+
+// Silence verbose console logs in production (preserves console.error and console.warn for diagnostics)
+if (process.env.NODE_ENV === 'production' && process.env.ENABLE_CONSOLE_LOGS !== 'true') {
+  const noop = () => {};
+  console.log = noop;
+  console.info = noop;
+  console.debug = noop;
+  console.trace = noop;
+  console.dir = noop;
+  console.table = noop;
+}
+
+// Validate environment variables before starting
+try {
+  validateEnv();
+} catch (error) {
+  console.error('Failed to start server:', error.message);
+  process.exit(1);
+}
+
+// Handle process-level errors
+handleUnhandledRejections();
+handleUncaughtExceptions();
+
+// Connect to database and load dynamic configurations
+connectDB().then(() => {
+  loadRateLimitsFromDb();
+});
+
+const app = express();
+// Trust all reverse proxies (Hostinger Nginx, Next.js rewrites, and Cloudflare)
+app.set('trust proxy', true);
+const server = http.createServer(app);
+initSocket(server);
+
+// Security middleware (must be early in the chain)
+app.use(securityHeaders);
+
+// HTTP Compression middleware (gzip/brotli - compresses JSON/HTML payloads > 1KB)
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
+
+app.use(performanceMonitoring); // Add performance monitoring
+app.use(requestLogger);
+
+// CORS configuration
+// We use a custom wrapper to allow all origins for the Paytm callback route,
+// as it must be accessible by external redirects from Paytm's domain.
+app.use((req, res, next) => {
+  if (req.originalUrl && req.originalUrl.includes('/api/payments/paytm/callback')) {
+    return cors({ origin: true, credentials: true })(req, res, next);
+  }
+  return cors(corsOptions)(req, res, next);
+});
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cookieParser());
+
+// Request sanitization
+app.use(sanitizeRequest);
+
+// Static files - CORS middleware MUST come before express.static
+app.use('/uploads', (req, res, next) => {
+  const origin = req.headers.origin;
+  res.set({
+    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+    'Access-Control-Allow-Credentials': origin ? 'true' : 'false'
+  });
+
+  // Handle OPTIONS preflight
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
+// Guard sensitive uploads (invoices, identity documents) from unauthorized public access
+const { protect: authProtect } = require('./middleware/authMiddleware');
+app.use('/uploads/invoices', authProtect);
+
+// Serve static files AFTER CORS and guards are set
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
+// Fallback for missing upload documents / files
+app.use('/uploads', (req, res) => {
+  res.status(404).json({
+    success: false,
+    code: 404,
+    message: `Document not found on server: ${req.path}`
+  });
+});
+
+// Apply rate limiting to all API routes
+app.use('/api/', apiLimiter);
+
+// Import routes
+const userRoutes = require('./routes/userRoutes');
+const jobRoutes = require('./routes/jobRoutes');
+const conversationRoutes = require('./routes/conversationRoutes');
+const messageRoutes = require('./routes/messageRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
+const authRoutes = require('./routes/authRoutes');
+const uploadRoutes = require('./routes/uploadRoutes');
+const ratingRoutes = require('./routes/ratingRoutes');
+const disputeRoutes = require('./routes/disputeRoutes');
+const documentRoutes = require('./routes/documentRoutes');
+const geolocationRoutes = require('./routes/geolocationRoutes');
+const workLogRoutes = require('./routes/workLogRoutes');
+const applicationRoutes = require('./routes/applicationRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
+const notificationCenterRoutes = require('./routes/notificationCenterRoutes');
+const translationRoutes = require('./routes/translationRoutes');
+const siteRoutes = require('./routes/siteRoutes');
+const appVersionRoutes = require('./routes/appVersionRoutes');
+const announcementRoutes = require('./routes/announcementRoutes');
+
+// API routes
+app.use('/api/users', userRoutes);
+app.use('/api/jobs', jobRoutes);
+app.use('/api/conversations', conversationRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/upload', uploadRoutes);
+app.use('/api/ratings', ratingRoutes);
+app.use('/api/disputes', disputeRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/geolocation', geolocationRoutes);
+app.use('/api/worklogs', workLogRoutes);
+app.use('/api/applications', applicationRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/notification-center', notificationCenterRoutes);
+app.use('/api/translate', translationRoutes);
+app.use('/api/site', siteRoutes);
+app.use('/api/app-version', appVersionRoutes);
+app.use('/api/announcements', announcementRoutes);
+
+// Favicon handler (prevent 404 errors)
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Shramik Seva API is running',
+    version: '1.0.0',
+    environment: process.env.NODE_ENV || 'development',
+  });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
+});
+
+// Metrics endpoint (protected - only in development or with valid auth)
+app.get('/api/metrics', (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+    try {
+      const token = authHeader.split(' ')[1];
+      const jwt = require('jsonwebtoken');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      // Only allow admin access
+      if (!decoded || decoded.role !== 'admin') {
+        return res.status(403).json({ success: false, message: 'Forbidden — admin only' });
+      }
+    } catch {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+    }
+  }
+
+  const metrics = getMetrics();
+  res.json({
+    success: true,
+    metrics,
+  });
+});
+
+// 404 handler - must be after all routes
+app.use(notFound);
+
+// Error handler - must be last
+app.use(errorHandler);
+
+// Initialize cron jobs
+console.log('🔄 Initializing cron jobs...');
+resetOtps();
+dailyWorkLog();
+ratingPrompt();
+notificationCleanup();
+dataCleanup();
+paymentReconciliation();
+console.log('✅ All cron jobs initialized');
+
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, '0.0.0.0', () => {
+  if (process.env.NODE_ENV === 'production' && process.env.ENABLE_CONSOLE_LOGS !== 'true') {
+    process.stdout.write(`🚀 Shramik Seva Backend Server running on port ${PORT} [production mode - console logs silenced]\n`);
+  } else {
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('🚀 Shramik Seva Backend Server');
+    console.log('═══════════════════════════════════════════════════════');
+    console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🔌 Port: ${PORT}`);
+    console.log(`🌐 Server: http://localhost:${PORT}`);
+    console.log(`💚 Health Check: http://localhost:${PORT}/api/health`);
+    console.log('═══════════════════════════════════════════════════════');
+    console.log('');
+  }
+});
